@@ -1,0 +1,172 @@
+AI 專家系統 - 前後端 SDUI (Server-Driven UI) API 契約規格書
+
+文件目的： 定義 LangGraph 後端與 React 前端之間的 Server-Sent Events (SSE) 通訊標準。透過「後端驅動介面 (SDUI)」的設計模式，前端無須處理複雜的圖節點 (Graph Node) 狀態切換，僅需依照本約定之 event 與 ui_type 渲染對應的 UI 元件。
+
+通訊協定： HTTP POST + Server-Sent Events (SSE)
+前端建議使用 @microsoft/fetch-event-source 進行串流接收。
+
+壹、後端下發格式 (Server -> Client)
+
+所有由後端推送的串流資料，皆嚴格遵守標準 SSE 格式：
+
+event: <事件類型>
+data: <JSON 字串>
+
+
+事件類型一：event: message (非阻塞型資訊)
+
+用於 AI 產生的對話回覆，或僅供展示、不需要使用者回傳資料的靜態 UI。
+
+1. 一般文字 (ui_type: text)
+
+// data: 
+{
+  "ui_type": "text",
+  "content": "已為您完成蝕刻製程的歷史參數分析，請參考以下數據："
+}
+
+
+2. 唯讀表格 (ui_type: readonly_table)
+前端收到後，請渲染為純展示用的靜態表格。
+
+// data: 
+{
+  "ui_type": "readonly_table",
+  "content": "以下為昨日異常機台的初步盤點結果：",
+  "payload": {
+    "title": "異常機台盤點清單 (純展示)",
+    "columns": ["機台編號", "異常代碼", "發生時間"],
+    "data": [
+      {"機台編號": "EQP-A01", "異常代碼": "ERR-092", "發生時間": "08:15"},
+      {"機台編號": "EQP-B04", "異常代碼": "ERR-104", "發生時間": "14:30"}
+    ]
+  }
+}
+
+
+事件類型二：event: interrupt (阻塞型人機協作)
+
+當 AI 流程暫停，需要使用者（如製程工程師）介入確認或填寫資料時觸發。前端需渲染對應的互動表單，並等待使用者點擊「確認送出」。
+
+1. 可編輯表格 (ui_type: editable_table)
+前端需渲染支援編輯的 DataGrid 表格。
+
+// data: 
+{
+  "ui_type": "editable_table",
+  "action_id": "confirm_etching_params_8891", // ⚠️ 重要：送出時必須原封不動帶回此 ID
+  "payload": {
+    "title": "⚠️ 請確認即將套用之蝕刻參數調整",
+    "columns": ["參數名稱", "原設定值", "AI 建議值"],
+    "data": [
+      {"參數名稱": "Gas Flow (sccm)", "原設定值": 150, "AI 建議值": 155},
+      {"參數名稱": "RF Power (W)", "原設定值": 800, "AI 建議值": 820}
+    ]
+  }
+}
+
+
+2. 動態表單 (ui_type: dynamic_form)
+用於收集使用者的特定資訊（如授權碼、日期、備註等）。前端需依照 schema 陣列動態產生輸入框。
+
+// data:
+{
+  "ui_type": "dynamic_form",
+  "action_id": "auth_override_404",
+  "payload": {
+    "title": "系統需要主管授權",
+    "description": "參數調整幅度過大，請輸入主管授權碼與原因以強制放行：",
+    "schema": [
+      {"field": "auth_code", "label": "授權碼 (6碼)", "type": "password", "required": true},
+      {"field": "reason", "label": "放行原因", "type": "text", "required": false}
+    ]
+  }
+}
+
+
+3. 確認對話框 (ui_type: confirmation_box)
+用於執行重大操作前的最後確認（如刪除、重啟機台）。前端僅需渲染按鈕（例如「確認」與「取消」）。
+
+// data:
+{
+  "ui_type": "confirmation_box",
+  "action_id": "restart_eqp_505",
+  "payload": {
+    "title": "危險操作警告",
+    "message": "您確定要強制重啟 EQP-A01 機台嗎？此動作將中斷目前所有批次。",
+    "actions": [
+      {"label": "確認重啟", "value": "confirm", "style": "danger"},
+      {"label": "取消", "value": "cancel", "style": "secondary"}
+    ]
+  }
+}
+
+
+事件類型三：event: error (系統錯誤)
+
+// data:
+{
+  "content": "後端推理超時，請稍後再試。"
+}
+
+
+貳、前端回傳格式 (Client -> Server)
+
+當使用者在 interrupt 畫面完成編輯、填寫表單或點擊確認按鈕後，前端需呼叫同一支 /stream API 發送 POST 請求，以喚醒後端 AI 流程。
+
+前端實作原則（無狀態傳遞）：
+前端不需要紀錄目前的對話走到哪一個 LangGraph 節點，只需要將收到的 action_id 與修改後的資料 payload 送回即可。
+
+請求 Method: POST /stream
+Request Headers: Content-Type: application/json
+
+Request Body 範例 (表格編輯回傳):
+
+{
+  "thread_id": "目前聊天室的 UUID",
+  "action_id": "confirm_etching_params_8891", // 從 interrupt 拿到的 ID
+  "payload": [ 
+    // 使用者在畫面上編輯完成的最終陣列
+    {"參數名稱": "Gas Flow (sccm)", "原設定值": 150, "AI 建議值": 160},
+    {"參數名稱": "RF Power (W)", "原設定值": 800, "AI 建議值": 820}
+  ]
+}
+
+
+Request Body 範例 (動態表單回傳):
+
+{
+  "thread_id": "目前聊天室的 UUID",
+  "action_id": "auth_override_404",
+  "payload": { 
+    "auth_code": "888888",
+    "reason": "已致電廠長口頭核准"
+  }
+}
+
+
+Request Body 範例 (確認對話框回傳):
+
+{
+  "thread_id": "目前聊天室的 UUID",
+  "action_id": "restart_eqp_505",
+  "payload": "confirm" // 回傳使用者點擊的按鈕 value
+}
+
+
+參、前端開發注意事項 (防雷指南)
+
+避免重複發送請求：
+因使用的 @microsoft/fetch-event-source 具有自動重連機制，當網路異常斷線時，可能會重新發起 POST 請求，導致後端 AI 重複執行動作。
+解決方案： 請務必在 onerror 回呼函式中直接 throw err; 以阻斷無限重試迴圈。
+
+單一資料流：
+後端保證不再吐出原始的 CSV 純文字，所有表格資料皆已預先轉換為 List of Objects (JSON Array)，前端可直接將 payload.data 綁定至 Table 元件。
+
+肆、待討論與決議事項 (Meeting Notes)
+
+[ ] 確認現有專案的 DataGrid 套件選型（是否支援動態傳入 columns 渲染）。
+
+[ ] 錯誤訊息 event: error 發生時的 UI 呈現方式（Toast 或是直接顯示在對話框內）。
+
+[ ] 前端在等待 SSE 回傳期間，畫面上 Loading 狀態 (Skeleton 或 Spinner) 的呈現方式。
