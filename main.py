@@ -125,52 +125,43 @@ async def chat_stream(req: ChatRequest):
         config = {"configurable": {"thread_id": req.thread_id}}
         
         try:
-            # 判斷是「恢復流程(Resume)」還是「新對話」
             if req.action_id is not None and req.payload is not None:
-                # 把前端編輯完的 payload 當作 resume 的值傳進去喚醒 Graph
                 stream = graph.astream(Command(resume=req.payload), config, stream_mode="updates")
             else:
                 if not req.message:
-                    yield f"data: {json.dumps({'type': 'error', 'content': 'Message cannot be empty'})}\n\n"
+                    # 輸出標準 SSE 錯誤格式
+                    yield f"event: error\ndata: {json.dumps({'content': 'Message cannot be empty'})}\n\n"
                     return
                 stream = graph.astream({"messages": [HumanMessage(content=req.message)]}, config, stream_mode="updates")
             
-            # === 攔截並格式化輸出 (API 契約轉換層) ===
             async for chunk in stream:
-                
-                # A. 處理中斷事件 (Interrupt)
+                # A. 處理中斷事件 (event: interrupt)
                 if "__interrupt__" in chunk:
                     interrupt_data = chunk["__interrupt__"][0].value
-                    
-                    # 按照契約，打包 type="interrupt"，加上節點吐出的 ui_type, action_id, payload
-                    response_event = {
-                        "type": "interrupt",
-                        **interrupt_data 
-                    }
-                    yield f"data: {json.dumps(response_event, ensure_ascii=False)}\n\n"
+                    # 輸出標準 SSE 格式
+                    yield f"event: interrupt\ndata: {json.dumps(interrupt_data, ensure_ascii=False)}\n\n"
                 
-                # B. 處理一般節點更新 (Message)
+                # B. 處理一般節點更新 (event: message)
                 else:
                     for node_name, node_data in chunk.items():
                         if node_data is not None and "messages" in node_data:
                             last_msg = node_data["messages"][-1]
                             
-                            # 嘗試從 additional_kwargs 提取隱藏的 UI 資訊，預設為一般 text
                             ui_type = last_msg.additional_kwargs.get("ui_type", "text")
                             payload = last_msg.additional_kwargs.get("payload", None)
                             
-                            response_event = {
-                                "type": "message",
+                            data_dict = {
                                 "ui_type": ui_type,
                                 "content": last_msg.content
                             }
                             if payload is not None:
-                                response_event["payload"] = payload
+                                data_dict["payload"] = payload
                                 
-                            yield f"data: {json.dumps(response_event, ensure_ascii=False)}\n\n"
+                            # 輸出標準 SSE 格式
+                            yield f"event: message\ndata: {json.dumps(data_dict, ensure_ascii=False)}\n\n"
                             
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+            yield f"event: error\ndata: {json.dumps({'content': str(e)}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
