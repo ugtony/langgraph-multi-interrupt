@@ -1,15 +1,13 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 
 export default function App() {
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
-  
-  const [uiMode, setUiMode] = useState('chat');
-  const [interruptData, setInterruptData] = useState(null);
-  const [editorContent, setEditorContent] = useState('');
-
-  // 👉 新增一個 State 用來儲存所有收到的 Event 日誌
   const [eventsLog, setEventsLog] = useState([]);
+  
+  // 中斷狀態現在只需要存一包完整的 API Event 即可
+  const [interruptData, setInterruptData] = useState(null);
+  const [editableGridData, setEditableGridData] = useState([]);
 
   const threadId = useRef(`thread-${Math.random().toString(36).substring(7)}`);
 
@@ -20,8 +18,6 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-
-      if (!response.body) throw new Error('ReadableStream not yet supported.');
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder('utf-8');
@@ -40,10 +36,7 @@ export default function App() {
             const jsonStr = part.replace(/^data:\s*/, '');
             try {
               const data = JSON.parse(jsonStr);
-              
-              // 👉 收到資料時，先把完整的 Event 塞進 Log 陣列中
               setEventsLog((prev) => [...prev, data]);
-              
               handleStreamEvent(data);
             } catch (e) {
               console.error('JSON Parse Error:', e);
@@ -58,108 +51,143 @@ export default function App() {
 
   const handleStreamEvent = (data) => {
     if (data.type === 'message') {
-      setMessages((prev) => [...prev, { sender: 'bot', text: data.content }]);
+      // 將後端傳來的 ui_type 與 payload 一起存入歷史紀錄
+      setMessages((prev) => [...prev, { 
+        sender: 'bot', 
+        content: data.content,
+        ui_type: data.ui_type,
+        payload: data.payload 
+      }]);
     } 
     else if (data.type === 'interrupt') {
-      const { event_type, payload } = data.data;
-      setInterruptData(payload);
-      setUiMode(event_type);
-      
-      if (event_type === 'csv_editor') {
-        setEditorContent(payload.csv_content);
-      } else if (event_type === 'text_input') {
-        setEditorContent('');
+      // 收到中斷，直接把整包 event 存起來
+      setInterruptData(data);
+      if (data.ui_type === 'editable_table') {
+        // 將 JSON Array 初始化進編輯器的 State
+        setEditableGridData(data.payload.data);
       }
-    }
-    else if (data.type === 'error') {
-      alert(`發生錯誤: ${data.content}`);
     }
   };
 
   const handleSendMessage = () => {
     if (!inputText.trim()) return;
-    setMessages((prev) => [...prev, { sender: 'user', text: inputText }]);
+    setMessages((prev) => [...prev, { sender: 'user', content: inputText, ui_type: 'text' }]);
     sendStreamRequest({ thread_id: threadId.current, message: inputText });
     setInputText('');
   };
 
   const handleSubmitInterrupt = () => {
-    sendStreamRequest({ thread_id: threadId.current, resume_data: editorContent });
-    setUiMode('chat');
-    setInterruptData(null);
-    setEditorContent('');
+    // 依照契約：回傳 action_id 與修改後的 payload 陣列
+    sendStreamRequest({ 
+      thread_id: threadId.current, 
+      action_id: interruptData.action_id,
+      payload: editableGridData 
+    });
+    setInterruptData(null); // 清空並關閉中斷畫面
   };
 
-  // 👉 使用 Flexbox 建立左右雙欄佈局
+  // 處理表格欄位變更
+  const handleCellChange = (rowIndex, colName, newValue) => {
+    const newData = [...editableGridData];
+    newData[rowIndex][colName] = newValue;
+    setEditableGridData(newData);
+  };
+
   return (
-    <div style={{ display: 'flex', gap: '20px', maxWidth: '1000px', margin: '40px auto', fontFamily: 'sans-serif' }}>
+    <div style={{ display: 'flex', gap: '20px', maxWidth: '1200px', margin: '40px auto', fontFamily: 'sans-serif' }}>
       
-      {/* ===== 左側：聊天室與動態 UI ===== */}
-      <div style={{ flex: 6, display: 'flex', flexDirection: 'column', gap: '10px' }}>
-        <h2>LangGraph Agentic UI</h2>
+      {/* 左側：對話區塊 */}
+      <div style={{ flex: 6, display: 'flex', flexDirection: 'column', gap: '15px' }}>
+        <h2>前端 React 實作 (Server-Driven UI)</h2>
         
-        <div style={{ height: '400px', overflowY: 'auto', border: '1px solid #ccc', padding: '15px', borderRadius: '8px' }}>
+        {/* 歷史對話區 */}
+        <div style={{ height: '500px', overflowY: 'auto', border: '1px solid #ccc', padding: '15px', borderRadius: '8px' }}>
           {messages.map((msg, index) => (
-            <div key={index} style={{ textAlign: msg.sender === 'user' ? 'right' : 'left', margin: '10px 0' }}>
-              <span style={{ 
+            <div key={index} style={{ textAlign: msg.sender === 'user' ? 'right' : 'left', margin: '15px 0' }}>
+              <div style={{ 
                 background: msg.sender === 'user' ? '#007bff' : '#f1f1f1', 
                 color: msg.sender === 'user' ? '#fff' : '#000',
-                padding: '8px 12px', 
-                borderRadius: '16px',
-                display: 'inline-block',
-                whiteSpace: 'pre-wrap'
+                padding: '10px 15px', borderRadius: '8px', display: 'inline-block', maxWidth: '80%', textAlign: 'left'
               }}>
-                {msg.text}
-              </span>
+                <div style={{ whiteSpace: 'pre-wrap', marginBottom: msg.ui_type !== 'text' ? '10px' : '0' }}>
+                  {msg.content}
+                </div>
+                
+                {/* 根據 ui_type 動態渲染歷史訊息中的唯讀表格 */}
+                {msg.ui_type === 'readonly_table' && msg.payload && (
+                  <div style={{ background: '#fff', color: '#000', padding: '10px', borderRadius: '4px', border: '1px solid #ddd' }}>
+                    <h4 style={{ margin: '0 0 10px 0' }}>{msg.payload.title}</h4>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '14px' }}>
+                      <thead>
+                        <tr style={{ background: '#eee' }}>
+                          {msg.payload.columns.map(col => <th key={col} style={{ border: '1px solid #ccc', padding: '6px' }}>{col}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {msg.payload.data.map((row, i) => (
+                          <tr key={i}>
+                            {msg.payload.columns.map(col => <td key={col} style={{ border: '1px solid #ccc', padding: '6px' }}>{row[col]}</td>)}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
             </div>
           ))}
         </div>
 
-        <div style={{ border: '1px solid #007bff', padding: '15px', borderRadius: '8px', background: '#f9f9f9' }}>
-          {uiMode === 'chat' && (
+        {/* 動態輸入區塊 (狀態機切換) */}
+        <div style={{ border: '2px solid #007bff', padding: '15px', borderRadius: '8px', background: '#f8f9fa' }}>
+          
+          {/* 一般對話模式 */}
+          {!interruptData && (
             <div style={{ display: 'flex', gap: '10px' }}>
               <input 
                 type="text" 
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-                placeholder="輸入 'csv' 或 'text' 測試中斷..."
+                placeholder="輸入 '唯讀' 或 '編輯' 測試流程..."
                 style={{ flex: 1, padding: '10px', borderRadius: '4px', border: '1px solid #ccc' }}
               />
-              <button onClick={handleSendMessage} style={{ padding: '10px 20px', cursor: 'pointer' }}>發送</button>
+              <button onClick={handleSendMessage} style={{ padding: '10px 20px', cursor: 'pointer', background: '#007bff', color: '#fff', border: 'none', borderRadius: '4px' }}>發送</button>
             </div>
           )}
 
-          {uiMode === 'csv_editor' && interruptData && (
+          {/* 編輯表格模式 (Interrupt) */}
+          {interruptData && interruptData.ui_type === 'editable_table' && (
             <div>
-              <h4 style={{ marginTop: 0 }}>{interruptData.title}</h4>
-              <textarea 
-                value={editorContent}
-                onChange={(e) => setEditorContent(e.target.value)}
-                rows={6}
-                style={{ width: '100%', fontFamily: 'monospace', padding: '8px', boxSizing: 'border-box' }}
-              />
-              <div style={{ marginTop: '10px', textAlign: 'right' }}>
-                <button onClick={handleSubmitInterrupt} style={{ padding: '8px 16px', background: '#28a745', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
-                  確認並提交修改
-                </button>
-              </div>
-            </div>
-          )}
-
-          {uiMode === 'text_input' && interruptData && (
-            <div>
-              <h4 style={{ marginTop: 0 }}>{interruptData.title}</h4>
-              <p style={{ fontSize: '14px', color: '#666' }}>{interruptData.description}</p>
-              <input 
-                type="text" 
-                value={editorContent}
-                onChange={(e) => setEditorContent(e.target.value)}
-                style={{ width: '100%', padding: '8px', boxSizing: 'border-box' }}
-              />
-               <div style={{ marginTop: '10px', textAlign: 'right' }}>
-                <button onClick={handleSubmitInterrupt} style={{ padding: '8px 16px', background: '#ffc107', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
-                  送出授權
+              <h3 style={{ marginTop: 0, color: '#d9534f' }}>{interruptData.payload.title}</h3>
+              <p style={{ fontSize: '12px', color: '#666' }}>Action ID: {interruptData.action_id}</p>
+              
+              <table style={{ width: '100%', borderCollapse: 'collapse', marginBottom: '15px', background: '#fff' }}>
+                <thead>
+                  <tr style={{ background: '#e9ecef' }}>
+                    {interruptData.payload.columns.map(col => <th key={col} style={{ border: '1px solid #ccc', padding: '8px' }}>{col}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {editableGridData.map((row, rowIndex) => (
+                    <tr key={rowIndex}>
+                      {interruptData.payload.columns.map(col => (
+                        <td key={col} style={{ border: '1px solid #ccc', padding: '4px' }}>
+                          <input 
+                            type="text" 
+                            value={row[col]} 
+                            onChange={(e) => handleCellChange(rowIndex, col, e.target.value)}
+                            style={{ width: '100%', boxSizing: 'border-box', padding: '4px', border: 'none', background: 'transparent' }}
+                          />
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div style={{ textAlign: 'right' }}>
+                <button onClick={handleSubmitInterrupt} style={{ padding: '10px 20px', background: '#28a745', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>
+                  確認無誤並送出
                 </button>
               </div>
             </div>
@@ -167,48 +195,20 @@ export default function App() {
         </div>
       </div>
 
-      {/* ===== 右側：Event 監控面板 ===== */}
+      {/* 右側：Event Logs 面板保持不變 */}
       <div style={{ flex: 4, display: 'flex', flexDirection: 'column' }}>
-        <h2 style={{ color: '#555' }}>Event Logs</h2>
-        <div style={{ 
-          flex: 1, 
-          background: '#1e1e1e', 
-          color: '#d4d4d4', 
-          padding: '15px', 
-          borderRadius: '8px', 
-          overflowY: 'auto', 
-          maxHeight: '520px',
-          boxShadow: 'inset 0 0 10px rgba(0,0,0,0.5)'
-        }}>
-          {eventsLog.length === 0 ? (
-            <div style={{ color: '#888', fontStyle: 'italic' }}>等待接收事件中...</div>
-          ) : (
-            eventsLog.map((ev, idx) => (
-              <div key={idx} style={{ 
-                borderBottom: '1px solid #333', 
-                paddingBottom: '10px', 
-                marginBottom: '10px' 
-              }}>
-                <div style={{ fontSize: '12px', color: '#4caf50', marginBottom: '4px' }}>
-                  #{idx + 1} - {new Date().toLocaleTimeString()}
-                </div>
-                {/* 利用 JSON.stringify 搭配 null, 2 參數，讓 JSON 縮排漂亮印出 */}
-                <pre style={{ margin: 0, fontSize: '13px', whiteSpace: 'pre-wrap', wordBreak: 'break-all', fontFamily: 'monospace' }}>
-                  {JSON.stringify(ev, null, 2)}
-                </pre>
-              </div>
-            ))
-          )}
+        <h2 style={{ color: '#555' }}>Event Logs 契約監控</h2>
+        <div style={{ flex: 1, background: '#1e1e1e', color: '#d4d4d4', padding: '15px', borderRadius: '8px', overflowY: 'auto', maxHeight: '600px' }}>
+          {eventsLog.length === 0 ? <div style={{ color: '#888' }}>等待接收事件中...</div> : eventsLog.map((ev, idx) => (
+            <div key={idx} style={{ borderBottom: '1px solid #333', paddingBottom: '10px', marginBottom: '10px' }}>
+              <div style={{ fontSize: '12px', color: '#4caf50', marginBottom: '4px' }}>#{idx + 1}</div>
+              <pre style={{ margin: 0, fontSize: '12px', whiteSpace: 'pre-wrap', fontFamily: 'monospace' }}>
+                {JSON.stringify(ev, null, 2)}
+              </pre>
+            </div>
+          ))}
         </div>
-        {/* 清空日誌按鈕 */}
-        <button 
-          onClick={() => setEventsLog([])} 
-          style={{ marginTop: '10px', padding: '8px', cursor: 'pointer', background: '#eee', border: '1px solid #ccc', borderRadius: '4px' }}
-        >
-          清空 Logs
-        </button>
       </div>
-
     </div>
   );
 }

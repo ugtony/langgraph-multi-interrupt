@@ -3,23 +3,16 @@ import requests
 import json
 import uuid
 import pandas as pd
-import io
 
-# 1. 初始化 Session State
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = f"thread-{uuid.uuid4().hex[:8]}"
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "events_log" not in st.session_state:
     st.session_state.events_log = []
-if "ui_mode" not in st.session_state:
-    st.session_state.ui_mode = "chat" # 'chat' | 'csv_editor' | 'text_input'
 if "interrupt_data" not in st.session_state:
     st.session_state.interrupt_data = None
-if "editor_content" not in st.session_state:
-    st.session_state.editor_content = ""
 
-# 2. 核心邏輯：發送請求並處理 SSE 串流
 def send_stream_request(payload):
     url = "http://localhost:8000/stream"
     try:
@@ -34,128 +27,102 @@ def send_stream_request(payload):
                             st.session_state.events_log.append(data)
                             
                             if data.get("type") == "message":
-                                st.session_state.messages.append({"role": "assistant", "content": data["content"]})
+                                # 將 ui_type 和 payload 存進歷史訊息中
+                                st.session_state.messages.append({
+                                    "role": "assistant", 
+                                    "content": data["content"],
+                                    "ui_type": data.get("ui_type", "text"),
+                                    "payload": data.get("payload")
+                                })
                             
                             elif data.get("type") == "interrupt":
-                                event_type = data["data"]["event_type"]
-                                payload_data = data["data"]["payload"]
+                                # 完整記錄整個 Interrupt 契約 (包含 action_id 等)
+                                st.session_state.interrupt_data = data
                                 
-                                st.session_state.interrupt_data = payload_data
-                                st.session_state.ui_mode = event_type
-                                
-                                if event_type == "text_input":
-                                    st.session_state.editor_content = ""
-                                    
                             elif data.get("type") == "error":
                                 st.error(f"發生錯誤: {data['content']}")
                                 
                         except json.JSONDecodeError:
                             pass
     except Exception as e:
-        st.error(f"無法連線到後端，錯誤: {e}")
+        st.error(f"連線失敗: {e}")
 
-# 3. 處理一般訊息與文字中斷的 Callbacks
 def handle_send_message():
     user_input = st.session_state.chat_input_text
-    if not user_input.strip():
-        return
-    st.session_state.messages.append({"role": "user", "content": user_input})
+    if not user_input.strip(): return
+    
+    st.session_state.messages.append({"role": "user", "content": user_input, "ui_type": "text"})
     st.session_state.chat_input_text = ""
-    send_stream_request({
-        "thread_id": st.session_state.thread_id,
-        "message": user_input
-    })
+    send_stream_request({"thread_id": st.session_state.thread_id, "message": user_input})
 
-def handle_submit_text_interrupt():
-    send_stream_request({
-        "thread_id": st.session_state.thread_id,
-        "resume_data": st.session_state.editor_content
-    })
-    st.session_state.ui_mode = "chat"
-    st.session_state.interrupt_data = None
-    st.session_state.editor_content = ""
-
-def clear_logs():
-    st.session_state.events_log = []
-
-
-# ==========================================
-# 4. Streamlit 介面佈局
-# ==========================================
-st.set_page_config(page_title="LangGraph Agentic UI", layout="wide")
+st.set_page_config(page_title="Server-Driven UI (Streamlit)", layout="wide")
 col_left, col_right = st.columns([6, 4])
 
-# ===== 左側：聊天室與動態 UI =====
 with col_left:
-    st.header("💬 LangGraph Agentic UI")
+    st.header("💬 LangGraph 前端介面 (API 契約驅動)")
     
-    chat_container = st.container(height=450)
+    # === 1. 歷史訊息與唯讀表格渲染區 ===
+    chat_container = st.container(height=500)
     with chat_container:
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
                 st.write(msg["content"])
                 
+                # 若歷史訊息帶有唯讀表格，在此動態渲染
+                if msg.get("ui_type") == "readonly_table" and msg.get("payload"):
+                    st.caption(msg["payload"].get("title", "報表資料"))
+                    # 將 JSON Array 轉成 DataFrame 並用內建唯讀表格顯示
+                    df = pd.DataFrame(msg["payload"]["data"])
+                    st.dataframe(df, hide_index=True, use_container_width=True)
+                
     st.divider()
 
-    # 狀態機：一般聊天模式
-    if st.session_state.ui_mode == "chat":
+    # === 2. 動態輸入區塊 (狀態機判斷) ===
+    if not st.session_state.interrupt_data:
+        # 一般對話模式
         with st.form(key="chat_form", clear_on_submit=False):
             col_input, col_btn = st.columns([8, 2])
             with col_input:
-                st.text_input("輸入訊息...", key="chat_input_text", placeholder="輸入 'csv' 或 'text' 測試中斷...")
+                st.text_input("輸入訊息...", key="chat_input_text", placeholder="輸入 '唯讀' 或 '編輯' 測試流程...")
             with col_btn:
                 st.form_submit_button("發送", use_container_width=True, on_click=handle_send_message)
 
-    # 狀態機：進階 CSV 表格編輯器模式
-    elif st.session_state.ui_mode == "csv_editor" and st.session_state.interrupt_data:
-        st.subheader(st.session_state.interrupt_data.get("title", "請確認並編輯資料"))
+    elif st.session_state.interrupt_data.get("ui_type") == "editable_table":
+        # 編輯器中斷模式
+        interrupt_payload = st.session_state.interrupt_data["payload"]
+        st.error(interrupt_payload.get("title", "請確認並編輯資料"))
+        st.caption(f"Action ID: {st.session_state.interrupt_data['action_id']}")
         
-        # 將後端傳來的 CSV 字串轉換為 pandas DataFrame
-        csv_str = st.session_state.interrupt_data.get("csv_content", "")
-        df = pd.read_csv(io.StringIO(csv_str))
+        # 將傳來的 JSON Array 轉換為 DataFrame 供編輯
+        df = pd.DataFrame(interrupt_payload["data"])
         
-        # 使用 st.data_editor 渲染互動式表格 (支援新增/刪除列)
+        # 渲染資料編輯器
         edited_df = st.data_editor(
             df, 
-            num_rows="dynamic", # 允許使用者動態新增或刪除資料列
-            use_container_width=True,
-            hide_index=True
+            num_rows="dynamic",
+            hide_index=True,
+            use_container_width=True
         )
         
-        # 這裡不使用 callback，直接用 if st.button 抓取最新的 edited_df
-        if st.button("✅ 確認並提交修改", type="primary"):
-            # 將編輯後的 DataFrame 轉回 CSV 字串
-            final_csv_str = edited_df.to_csv(index=False)
+        if st.button("✅ 確認無誤並送出", type="primary"):
+            # 將編輯後的 DataFrame 轉回 JSON Array (List of Dicts)
+            final_data_list = edited_df.to_dict(orient="records")
             
-            # 打回後端喚醒 Graph
+            # 打回後端，帶上 action_id 與修改後的陣列
             send_stream_request({
                 "thread_id": st.session_state.thread_id,
-                "resume_data": final_csv_str
+                "action_id": st.session_state.interrupt_data["action_id"],
+                "payload": final_data_list
             })
             
-            # 重置狀態並強制重繪畫面
-            st.session_state.ui_mode = "chat"
             st.session_state.interrupt_data = None
             st.rerun()
 
-    # 狀態機：一般文字輸入模式
-    elif st.session_state.ui_mode == "text_input" and st.session_state.interrupt_data:
-        st.subheader(st.session_state.interrupt_data.get("title", "請輸入資訊"))
-        st.caption(st.session_state.interrupt_data.get("description", ""))
-        st.session_state.editor_content = st.text_input("輸入內容：", value=st.session_state.editor_content)
-        st.button("🚀 送出授權", on_click=handle_submit_text_interrupt, type="primary")
-
-# ===== 右側：Event 監控面板 =====
 with col_right:
-    st.header("📡 Event Logs")
-    st.button("🗑️ 清空 Logs", on_click=clear_logs)
-    
-    log_container = st.container(height=550)
+    st.header("📡 Event Logs 契約監控")
+    st.button("🗑️ 清空 Logs", on_click=lambda: st.session_state.events_log.clear())
+    log_container = st.container(height=600)
     with log_container:
-        if not st.session_state.events_log:
-            st.info("等待接收事件中...")
-        else:
-            for idx, ev in enumerate(reversed(st.session_state.events_log)):
-                real_idx = len(st.session_state.events_log) - idx
-                st.caption(f"Event #{real_idx}")
-                st.json(ev)
+        for idx, ev in enumerate(reversed(st.session_state.events_log)):
+            st.caption(f"Event #{len(st.session_state.events_log) - idx}")
+            st.json(ev)

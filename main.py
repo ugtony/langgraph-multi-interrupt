@@ -1,6 +1,7 @@
 import json
+import uuid
 import uvicorn
-from typing import TypedDict
+from typing import TypedDict, Any
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -18,75 +19,91 @@ class State(TypedDict):
     messages: list
 
 def router_node(state: State):
-    """
-    這是一個扮演 Router 的節點。
-    實務上你可以用 LLM 判斷意圖，這裡用關鍵字來示範兩種不同的 Interrupt 分支。
-    """
+    """根據關鍵字路由到不同的 UI 測試節點"""
     last_msg = state["messages"][-1].content.lower()
     
-    if "csv" in last_msg:
-        # 使用 Command(goto=...) 讓流程跳轉到對應節點 (LangGraph 0.2+ 寫法)
-        return Command(goto="csv_interrupt_node")
-    elif "text" in last_msg or "文字" in last_msg:
-        return Command(goto="text_interrupt_node")
+    if "唯讀" in last_msg or "readonly" in last_msg:
+        return Command(goto="readonly_table_node")
+    elif "編輯" in last_msg or "edit" in last_msg:
+        return Command(goto="editable_table_node")
     else:
         return Command(goto="chat_node")
 
 def chat_node(state: State):
-    """處理一般對話的節點"""
+    """1. 一般文字訊息 (ui_type: text)"""
     last_msg = state["messages"][-1].content
-    response_text = f"伺服器收到一般訊息：'{last_msg}'。\n(提示：輸入 'csv' 測試表格中斷，輸入 'text' 測試文字中斷)"
+    response_text = f"伺服器收到：'{last_msg}'。\n(提示：輸入 '唯讀' 測試靜態表格，輸入 '編輯' 測試中斷表格)"
+    
+    # 預設不帶 additional_kwargs，攔截器會自動判斷為 ui_type: text
     return {"messages": [AIMessage(content=response_text)]}
 
-def csv_interrupt_node(state: State):
-    """處理 CSV 編輯的中斷節點"""
-    # 觸發中斷，這包 dict 會被拋到前端
-    user_edited_csv = interrupt({
-        "event_type": "csv_editor",
-        "payload": {
-            "title": "請確認並編輯以下 CSV 資料",
-            "csv_content": "id,name,role\n1,Alice,Admin\n2,Bob,User"
-        }
-    })
+def readonly_table_node(state: State):
+    """2. 純展示用表格 (ui_type: readonly_table)"""
+    table_payload = {
+        "title": "📊 2026年 第一季銷售總覽 (純展示)",
+        "columns": ["月份", "營收 (萬)", "達成率"],
+        "data": [
+            {"月份": "1月", "營收": 150, "達成率": "95%"},
+            {"月份": "2月", "營收": 180, "達成率": "110%"}
+        ]
+    }
     
-    # 當前端呼叫 Resume 喚醒此節點後，user_edited_csv 就會是前端傳回來的資料
-    return {"messages": [AIMessage(content=f"太棒了！已收到前端回傳的 CSV 更新：\n{user_edited_csv}")]}
+    # 將 UI Schema 藏在 additional_kwargs 中
+    msg = AIMessage(
+        content="為您產生了最新的報表：", 
+        additional_kwargs={
+            "ui_type": "readonly_table",
+            "payload": table_payload
+        }
+    )
+    return {"messages": [msg]}
 
-def text_interrupt_node(state: State):
-    """處理一般文字輸入的中斷節點"""
-    user_text = interrupt({
-        "event_type": "text_input",
-        "payload": {
-            "title": "系統需要你的進階授權",
-            "description": "請輸入 4 碼數字授權碼以繼續執行動作："
-        }
+def editable_table_node(state: State):
+    """3. 需要使用者編輯/確認的表格 (ui_type: editable_table)"""
+    
+    # 產生一個唯一的 action_id 給前端
+    action_id = f"confirm_users_{uuid.uuid4().hex[:6]}"
+    
+    table_payload = {
+        "title": "⚠️ 系統即將匯入以下名單，請確認並編輯欄位：",
+        "columns": ["姓名", "部門", "權限"],
+        "data": [
+            {"姓名": "Alice", "部門": "RD", "權限": "Admin"},
+            {"姓名": "Bob", "部門": "Sales", "權限": "User"}
+        ]
+    }
+    
+    # 觸發中斷，直接依照 API 契約回傳所需的 JSON 結構
+    user_edited_data = interrupt({
+        "ui_type": "editable_table",
+        "action_id": action_id,
+        "payload": table_payload
     })
     
-    return {"messages": [AIMessage(content=f"授權成功！你輸入的授權碼為：{user_text}，流程繼續執行。")]}
+    # 當前端打回 Resume API 喚醒此節點後，user_edited_data 就是前端傳回來的新陣列
+    msg = AIMessage(content=f"✅ 已收到前端回傳的修改資料：\n{json.dumps(user_edited_data, ensure_ascii=False)}")
+    return {"messages": [msg]}
 
 # 組裝 Graph
 builder = StateGraph(State)
 builder.add_node("router_node", router_node)
 builder.add_node("chat_node", chat_node)
-builder.add_node("csv_interrupt_node", csv_interrupt_node)
-builder.add_node("text_interrupt_node", text_interrupt_node)
+builder.add_node("readonly_table_node", readonly_table_node)
+builder.add_node("editable_table_node", editable_table_node)
 
 builder.add_edge(START, "router_node")
 builder.add_edge("chat_node", END)
-builder.add_edge("csv_interrupt_node", END)
-builder.add_edge("text_interrupt_node", END)
+builder.add_edge("readonly_table_node", END)
+builder.add_edge("editable_table_node", END)
 
-# 必須加上 Checkpointer 才能使用 interrupt 暫停/恢復功能
 memory = MemorySaver()
 graph = builder.compile(checkpointer=memory)
-
 
 # ==========================================
 # 2. 定義 FastAPI 應用程式與串流 API
 # ==========================================
 app = FastAPI()
 
-# 允許跨域請求 (開發前端時會用到)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -98,42 +115,59 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     thread_id: str
     message: str | None = None
-    resume_data: str | None = None  # 前端打回來恢復流程的資料
+    # 為了配合前端統一打回來的規格，新增這兩個欄位
+    action_id: str | None = None
+    payload: Any = None  # 接收前端修改後的陣列資料
 
 @app.post("/stream")
 async def chat_stream(req: ChatRequest):
     async def event_generator():
-        # 設定 thread_id 以維持對話與中斷狀態
         config = {"configurable": {"thread_id": req.thread_id}}
         
         try:
-            if req.resume_data is not None:
-                # 1. 若為 Resume 請求：帶入前端的回傳資料，喚醒暫停的 Graph
-                stream = graph.astream(Command(resume=req.resume_data), config, stream_mode="updates")
+            # 判斷是「恢復流程(Resume)」還是「新對話」
+            if req.action_id is not None and req.payload is not None:
+                # 把前端編輯完的 payload 當作 resume 的值傳進去喚醒 Graph
+                stream = graph.astream(Command(resume=req.payload), config, stream_mode="updates")
             else:
-                # 2. 若為一般請求：將新訊息傳入 Graph
                 if not req.message:
                     yield f"data: {json.dumps({'type': 'error', 'content': 'Message cannot be empty'})}\n\n"
                     return
-                inputs = {"messages": [HumanMessage(content=req.message)]}
-                stream = graph.astream(inputs, config, stream_mode="updates")
+                stream = graph.astream({"messages": [HumanMessage(content=req.message)]}, config, stream_mode="updates")
             
-            # 處理 LangGraph 產生的串流事件 (Server-Sent Events)
+            # === 攔截並格式化輸出 (API 契約轉換層) ===
             async for chunk in stream:
-                # LangGraph 0.2 在 updates 模式下，會以 "__interrupt__" key 拋出中斷
-                if "__interrupt__" in chunk:
-                    # 取出我們在 interrupt() 中定義的字典 payload
-                    # (chunk["__interrupt__"] 是一個 Tuple，包含 Interrupt 物件)
-                    interrupt_value = chunk["__interrupt__"][0].value
-                    yield f"data: {json.dumps({'type': 'interrupt', 'data': interrupt_value}, ensure_ascii=False)}\n\n"
                 
+                # A. 處理中斷事件 (Interrupt)
+                if "__interrupt__" in chunk:
+                    interrupt_data = chunk["__interrupt__"][0].value
+                    
+                    # 按照契約，打包 type="interrupt"，加上節點吐出的 ui_type, action_id, payload
+                    response_event = {
+                        "type": "interrupt",
+                        **interrupt_data 
+                    }
+                    yield f"data: {json.dumps(response_event, ensure_ascii=False)}\n\n"
+                
+                # B. 處理一般節點更新 (Message)
                 else:
-                    # 擷取一般 Node 的狀態更新並回傳對話文字
                     for node_name, node_data in chunk.items():
-                        # 👉 新增 node_data is not None 的判斷
                         if node_data is not None and "messages" in node_data:
-                            last_msg = node_data["messages"][-1].content
-                            yield f"data: {json.dumps({'type': 'message', 'node': node_name, 'content': last_msg}, ensure_ascii=False)}\n\n"
+                            last_msg = node_data["messages"][-1]
+                            
+                            # 嘗試從 additional_kwargs 提取隱藏的 UI 資訊，預設為一般 text
+                            ui_type = last_msg.additional_kwargs.get("ui_type", "text")
+                            payload = last_msg.additional_kwargs.get("payload", None)
+                            
+                            response_event = {
+                                "type": "message",
+                                "ui_type": ui_type,
+                                "content": last_msg.content
+                            }
+                            if payload is not None:
+                                response_event["payload"] = payload
+                                
+                            yield f"data: {json.dumps(response_event, ensure_ascii=False)}\n\n"
                             
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
